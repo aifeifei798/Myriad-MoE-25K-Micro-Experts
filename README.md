@@ -127,7 +127,7 @@ Testing across polarized tasks confirms that the macro router cleanly shifts rep
 ### 2. Standalone Cartridge Forging
 Train an arbitrary domain rulebook (e.g., `custom_data.jsonl`, 20 samples) in ~20 seconds to export a standalone cartridge (`cartridge_gongfang.pt`):
 ```bash
-python 5.train_single_cartridge.py
+python 4.train_single_cartridge.py
 ```
 
 ### 3. Live Hot-Swapping (`/plug`)
