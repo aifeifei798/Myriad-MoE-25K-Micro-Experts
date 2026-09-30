@@ -158,8 +158,8 @@ python fuse_cartridges.py
 
 ### 1. 环境准备
 ```bash
-git clone https://github.com/aifeifei798/DualBigLittle-MoE.git
-cd DualBigLittle-MoE
+git clone https://github.com/aifeifei798/Myriad-MoE-25K-Micro-Experts.git
+cd Myriad-MoE-25K-Micro-Experts
 pip install torch transformers datasets accelerate
 ```
 
