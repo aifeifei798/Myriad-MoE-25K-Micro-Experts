@@ -82,10 +82,16 @@ $$\gamma = \frac{1}{\sqrt{d_{\text{model}}}}$$
 This formulation guarantees that regardless of model scaling, the perturbation energy injected by active micro-experts remains invariant and unit-isotropic across all network depths.
 
 ### 2. Low-Rank Tensor Contraction During Training
+
 During batch training across 25,200 experts, materializing the full 5D intermediate tensor $[B, S, C, E, D]$ would consume over 1.4 GB per layer in activations. We perform early contraction within the low-rank bottleneck:
-$$h = \text{einsum}('bsd,cerd \to bscer', x, A) \quad [\approx 23 \text{ MB}]$$
-$$\text{clustered\_out} = \text{einsum}('bscer,cedr \to bscd', h, B) \cdot \frac{1}{45} \quad [\approx 33 \text{ MB}]$$
-$$\text{micro\_out} = \text{einsum}('bsc,bscd \to bsd', w_{\text{cluster}}, \text{clustered\_out})$$
+
+$$
+\begin{aligned}
+h &= \operatorname{einsum}(\text{'bsd,cerd} \to \text{bscer'}, x, A) && [\approx 23\text{ MB}] \\
+\text{clustered\_out} &= \operatorname{einsum}(\text{'bscer,cedr} \to \text{bscd'}, h, B) \cdot \frac{1}{45} && [\approx 33\text{ MB}] \\
+\text{micro\_out} &= \operatorname{einsum}(\text{'bsc,bscd} \to \text{bsd'}, w_{\text{cluster}}, \text{clustered\_out})
+\end{aligned}
+$$
 
 This formulation reduces training VRAM footprint by **97.6%**, enabling 25,200-expert training within **10 GB VRAM** at **9.8 samples/sec** on a single consumer GPU.
 
