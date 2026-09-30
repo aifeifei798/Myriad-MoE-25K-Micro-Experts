@@ -119,7 +119,7 @@ $$\text{micro\_out} = \text{einsum}('bsc,bscd \to bsd', w_{\text{cluster}}, \tex
 ### 2. 单卡带独立锻造（20 秒产出一个技能卡带）
 针对特定领域问答（如 `custom_data.jsonl`，20 条问答），可在 20 秒内独立淬炼出一个独立的技能卡带（`cartridge_gongfang.pt`）：
 ```bash
-python 5.train_single_cartridge.py
+python 4.train_single_cartridge.py
 ```
 
 ### 3. 在线内存秒级热插拔（`/plug` 指令）
