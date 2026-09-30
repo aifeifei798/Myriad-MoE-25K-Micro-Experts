@@ -166,7 +166,7 @@ python fuse_cartridges.py
 
 ### 1. Environment Setup
 ```bash
-git clone https://github.com/aifeifei798/DualBigLittle-MoE.git
+git clone https://github.com/aifeifei798/Myriad-MoE-25K-Micro-Experts.git
 cd DualBigLittle-MoE
 pip install torch transformers datasets accelerate
 ```
