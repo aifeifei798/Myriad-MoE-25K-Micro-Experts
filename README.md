@@ -83,15 +83,18 @@ This formulation guarantees that regardless of model scaling, the perturbation e
 
 ### 2. Low-Rank Tensor Contraction During Training
 
-During batch training across 25,200 experts, materializing the full 5D intermediate tensor $[B, S, C, E, D]$ would consume over 1.4 GB per layer in activations. We perform early contraction within the low-rank bottleneck:
+During batch training across 25,200 experts, materializing the full 5D intermediate tensor `[B, S, C, E, D]` would consume over 1.4 GB per layer in activations. We perform early contraction within the low-rank bottleneck:
 
-$$
-\begin{aligned}
-h &= \operatorname{einsum}(\text{'bsd,cerd} \to \text{bscer'}, x, A) && [\approx 23\text{ MB}] \\
-\text{clustered\_out} &= \operatorname{einsum}(\text{'bscer,cedr} \to \text{bscd'}, h, B) \cdot \frac{1}{45} && [\approx 33\text{ MB}] \\
-\text{micro\_out} &= \operatorname{einsum}(\text{'bsc,bscd} \to \text{bsd'}, w_{\text{cluster}}, \text{clustered\_out})
-\end{aligned}
-$$
+```python
+# 1. Low-rank projection: [B, S, D] @ [C, E, R, D]^T -> [B, S, C, E, R] (~23 MB)
+h = torch.einsum('bsd,cerd->bscer', x, self.lora_A)
+
+# 2. Contraction & normalization: [B, S, C, E, R] @ [C, E, D, R]^T -> [B, S, C, D] (~33 MB)
+clustered_out = torch.einsum('bscer,cedr->bscd', h, self.lora_B) / 45.0
+
+# 3. Macro routing aggregation: [B, S, C] @ [B, S, C, D] -> [B, S, D]
+micro_out = torch.einsum('bsc,bscd->bsd', w_cluster, clustered_out)
+```
 
 This formulation reduces training VRAM footprint by **97.6%**, enabling 25,200-expert training within **10 GB VRAM** at **9.8 samples/sec** on a single consumer GPU.
 
