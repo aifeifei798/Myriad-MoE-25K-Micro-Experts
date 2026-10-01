@@ -7,6 +7,8 @@ from collections import Counter
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+import tilelang
+import tilelang.language as T
 
 # 🌟 扩展至 20 宗门定义（含 4 大预留插槽）
 CLUSTER_NAMES = [
@@ -37,6 +39,68 @@ CLUSTER_NAMES = [
     "Custom_Logic"  # #19: 专属推理/任务插槽
 ]
 
+# ═══════════════════════════════════════════════════════════════
+# 🌟 修复版 TileLang 融合算子
+# 计算: Out[M, D] = (1/E) * sum_e ( X[M, D] @ A[e, R, D]^T ) @ B[e, D, R]^T
+# ═══════════════════════════════════════════════════════════════
+@tilelang.jit
+def fused_multi_lora_kernel(
+    X,  # [M, D] bf16
+    A,  # [E, R, D] bf16
+    B,  # [E, D, R] bf16
+    Out,  # [M, D] fp32 (必须先清零, 专家维度用 atomic_add 归约)
+    block_M: int = 16,
+    block_D: int = 64):
+    M, D, E, R = T.const("M, D, E, R")
+
+    X: T.Tensor((M, D), T.bfloat16)
+    A: T.Tensor((E, R, D), T.bfloat16)
+    B: T.Tensor((E, D, R), T.bfloat16)
+    Out: T.Tensor((M, D), T.float32)
+
+    # 🌟 修正 1: 专家维 E 提到 grid 的第 3 维做并行 (原写法 for e in T.Serial(E)
+    #            把 45 个专家串行跑在一个 CTA 里, 慢且占据全部时间)
+    # 🌟 修正 2: threads=32 (原 threads=128 → 4 warps 无法覆盖 M=16,N=16 的
+    #            第一个 gemm, 编译期直接 Fatal 退出)
+    with T.Kernel(T.ceildiv(D, block_D),
+                  T.ceildiv(M, block_M),
+                  E,
+                  threads=32) as (bx, by, bz):
+      X_shared = T.alloc_shared((block_M, block_D), T.bfloat16)
+      A_shared = T.alloc_shared((R, block_D), T.bfloat16)
+      B_shared = T.alloc_shared((block_D, R), T.bfloat16)
+      # 🌟 修正 3: 共享内存 / fragment 必须在循环外分配一次
+      #            (原代码在 for 体内 alloc, 每轮重新分配, 布局推断失败)
+      h_shared = T.alloc_shared((block_M, R), T.bfloat16)
+      h_frag = T.alloc_fragment((block_M, R), T.float32)
+      acc_out = T.alloc_fragment((block_M, block_D), T.float32)
+      T.clear(h_frag)
+      T.clear(acc_out)
+
+      # gemm1: h[M, R] = X[M, D] @ A[bz]^T[D, R]
+      for k_d in T.Pipelined(T.ceildiv(D, block_D), num_stages=3):
+        T.copy(X[by * block_M, k_d * block_D], X_shared)
+        # 🌟 修正 4: A[e, :, k] 切片在 dim2 留下非 1 extent, 触发
+        #            "base_ranges has extra non-1 extent at dim 2"
+        #            改成 T.copy(A[bz, 0, k], A_shared) 走前导维
+        T.copy(A[bz, 0, k_d * block_D], A_shared)
+        T.gemm(X_shared, A_shared, h_frag, transpose_B=True)
+
+      # 🌟 修正 5: h_frag 是 fp32 fragment, B_shared 是 bf16, 混合 dtype
+      #            的 gemm 会被拒绝 → 先搬进 bf16 共享内存当 gemm 输入
+      for i, j in T.Parallel(block_M, R):
+        h_shared[i, j] = h_frag[i, j]
+
+      # gemm2: acc[M, D] += h[M, R] @ B[bz]^T[R, D]
+      # 🌟 修正 6: B[e, bx*block_D, :] 同样有切片问题 → 用前导维
+      T.copy(B[bz, bx * block_D, 0], B_shared)
+      T.gemm(h_shared, B_shared, acc_out, transpose_B=True)
+
+      # 专家维已在 grid 上并行, 用 atomic_add 汇总到 fp32 输出
+      scale = 1.0 / 45.0
+      for i, j in T.Parallel(block_M, block_D):
+        T.atomic_add(Out[by * block_M + i, bx * block_D + j],
+                     acc_out[i, j] * scale)
 
 class MyriadInferenceWrapper(nn.Module):
 
@@ -90,9 +154,10 @@ class MyriadInferenceWrapper(nn.Module):
         self.layer_cluster_activity.clear()  # 🌟 同步清空
 
     def forward(self, x):
+        b, s, d = x.shape
         current_token = x[:, -1:, :]
 
-        # 1. 双大核文理动态调度
+        # 1. 双大核文理动态调度 (保持不变)
         logits_big = self.router_big(current_token)
         w_big = torch.softmax(logits_big, dim=-1)
         self.total_arts_weight += w_big[0, 0, 0].item()
@@ -102,20 +167,17 @@ class MyriadInferenceWrapper(nn.Module):
         sci_out = self.big_sci(x)
         big_out = (w_big[..., 0:1] * arts_out) + (w_big[..., 1:2] * sci_out)
 
-        # 2. 20 宗门动态路由
+        # 2. 20 宗门动态路由 (保持不变)
         logits_cluster = self.router_cluster(current_token)
         w_cluster = torch.softmax(logits_cluster, dim=-1)
-
-        # 选出得分最高的 Top-2 宗门
         top2_scores, top2_clusters = torch.topk(w_cluster, k=2, dim=-1)
         c1 = top2_clusters[0, 0, 0].item()
         c2 = top2_clusters[0, 0, 1].item()
         self.cluster_counter[c1] += 1
         self.cluster_counter[c2] += 1
-        # 🌟 累加本层的宗门活跃度
         self.layer_cluster_activity[c1] += 1
 
-        # 3. 异步流式拉取对口宗门的专家切片 (DMA 非阻塞极速传输)
+        # 3. 异步流式拉取对口宗门的专家切片 (DMA 非阻塞)
         with torch.cuda.stream(self.transfer_stream):
             A1 = self.lora_A_cpu[c1].to(self.device, non_blocking=True)
             B1 = self.lora_B_cpu[c1].to(self.device, non_blocking=True)
@@ -123,17 +185,50 @@ class MyriadInferenceWrapper(nn.Module):
             B2 = self.lora_B_cpu[c2].to(self.device, non_blocking=True)
         torch.cuda.current_stream().wait_stream(self.transfer_stream)
 
-        # 组内精算并融合
-        # 宗门 1
-        h1 = torch.einsum('bsd,erd->bser', x, A1)
-        out1 = torch.sum(torch.einsum('bser,edr->bsed', h1, B1), dim=2) / 45.0
+        # ═══════════════════════════════════════════════════════════════
+        # 🚀【极速融合执行区】：带 16-Row 对齐 + 双轨安全容错
+        # ═══════════════════════════════════════════════════════════════
+        x_2d = x.view(-1, d)
+        M_len = x_2d.shape[0]
 
-        # 宗门 2
-        h2 = torch.einsum('bsd,erd->bser', x, A2)
-        out2 = torch.sum(torch.einsum('bser,edr->bsed', h2, B2), dim=2) / 45.0
+        if M_len > 1:
+            # 🌟 Prefill 阶段 (长 Prompt)：直接走批量 einsum
+            h1 = torch.einsum('bsd,erd->bser', x, A1)
+            out1 = torch.sum(torch.einsum('bser,edr->bsed', h1, B1), dim=2) / 45.0
+
+            h2 = torch.einsum('bsd,erd->bser', x, A2)
+            out2 = torch.sum(torch.einsum('bser,edr->bsed', h2, B2), dim=2) / 45.0
+        else:
+            # 🚀 Decode 阶段 (M=1 逐字吐字)：
+            # 🌟 修正: 之前用 torch.empty 传 bf16 输出, 但算子内部用 atomic_add
+            #            汇总专家维, 必须传"已清零的 fp32"累加缓冲
+            try:
+                # 硬件张量核要求 M>=16，Pad 15 行零对齐输入
+                x_pad = torch.zeros(16, d, device=self.device, dtype=x.dtype)
+                x_pad[0:1] = x_2d
+                acc1 = torch.zeros(16, d, device=self.device, dtype=torch.float32)
+                acc2 = torch.zeros(16, d, device=self.device, dtype=torch.float32)
+
+                # 调用 TileLang 融合算子
+                fused_multi_lora_kernel(x_pad, A1, B1, acc1)
+                fused_multi_lora_kernel(x_pad, A2, B2, acc2)
+
+                out1 = acc1[0:1].to(x.dtype).view(b, s, d)
+                out2 = acc2[0:1].to(x.dtype).view(b, s, d)
+            except Exception as e:
+                # 🛡️ 安全兜底：走超轻量 cuBLAS Batched GEMV（无需中间 4D 显存分配，同样零卡顿）
+                if not getattr(self, "_kernel_warned", False):
+                    print(f"\n⚠️ [TileLang 算子不可用, 已回退到 cuBLAS 兜底路径] {type(e).__name__}: {str(e).splitlines()[0][:120]}")
+                    print("   (若要修好算子, 删掉本 try/except 看完整报错)\n")
+                    self._kernel_warned = True
+                x_vec = x_2d.unsqueeze(-1)  # [1, 1024, 1]
+                h1 = torch.matmul(A1, x_vec)  # [45, 16, 1]
+                out1 = torch.matmul(B1, h1).mean(dim=0).view(b, s, d)
+
+                h2 = torch.matmul(A2, x_vec)
+                out2 = torch.matmul(B2, h2).mean(dim=0).view(b, s, d)
 
         micro_out = top2_scores[..., 0:1] * out1 + top2_scores[..., 1:2] * out2
-
         return big_out + 0.3 * micro_out
 
 
