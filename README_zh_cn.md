@@ -428,5 +428,13 @@ python 5.fuse_cartridges.py          # → myriad_moe_25k_ultimate_fused.pt
 2. **零拷贝视图存储共享（Zero-Copy View Storage Sharing）**：将 3D/4D 微专家张量权重扁平化为共享同一底层显存的 2D 内存视图，从而支持原地封印（caging）、单层狙击（sniping）与卡带热插拔，且不会使静态 CUDA Graph 失效。
 3. **闭式 Ridge 特征投影（Closed-Form Ridge Feature Projection）**：一套通过岭回归把线性残差 LoRA 增量吸收进标准 SwiGLU down-projection 权重的数学框架，使 100% 原生 Dense 导出成为可能。
 4. **解耦式异步槽位回收（Decoupled Asynchronous Slot Reaping）**：用解耦的后台协程守护 CUDA Graph 执行队列，避免 HTTP 取消时信号量被过早释放。
+5. **偏置重参数化的路由控制（Bias-Reparameterized Routing Control）**：把专家门控表达为**路由器 logits 的加性偏置**，而非对专家权重的改写，使任何控制操作都不改变张量指针。持久封印与逐请求聚焦两路独立偏置相加，合成进唯一权威偏置缓冲区并以原地 `copy_()` 写入 —— 这正是已捕获的 CUDA Graph 能在封印、解封、狙击、聚焦、卡带热插拔等操作后依然保持有效的原因。
+6. **语义层架构兼容性校验（Semantic Architecture-Compatibility Validation）**：在权重移植**之前**校验源架构与目标架构在张量形状无法体现的结构上是否一致 —— 是否存在 per-head 归一化子模块（`q_norm` / `k_norm`）、`head_dim`、注意力头数与 KV 组数的比值。形状吻合而语义不符的移植（例如把带 QK-Norm 的 Qwen3 底座导出到不含该结构的架构）否则会**静默失败**，产出退化模型而非报错。
+7. **落盘前的数值等价闸门（Pre-Artifact Numerical Equivalence Gate）**：由独立推导的闭式参考实现重算导出模块的输出，未达 cosine 阈值（0.999）即拒绝该产物，且校验发生在多 GB 权重写盘**之前**。采样生成中看不出的吸收与路由错误由此在导出期即被拦截。
+8. **异常安全的路由覆盖作用域（Exception-Safe Scoped Routing Override）**：把逐请求的路由约束（宗门聚焦、动态开核）施加于**共享**的常驻模型状态，在 `finally` 子句中还原先前状态，并以单槽位信号量串行化访问 —— 使取消、异常或超时都无法把路由状态泄漏到其他请求。
+9. **可恢复暂存的单层专家隔离（Per-Layer Expert Isolation with Restorable Stash）**：克隆原专家张量、原地置零、并置上对应的路由偏置，从而**单层内的单个专家**可被抑制并随后恢复，且不波及其他任何宗门或层。
+10. **低秩空间内的路由权重提前吸收（Early Routing-Weight Absorption in Low-Rank Space）**：在第二次收缩**之前**把宗门路由权重乘进 `[B, S, C, E, R]` 低秩张量，用单次 einsum 同时规约宗门、专家与秩三个轴，从而稠密的 `[B, S, C, E, D]` 中间张量永不被物化。
+11. **方差不变的微专家缩放（Variance-Invariant Micro-Expert Scaling, μP-style）**：微专家因子以 `1/√R` 初始化、专家数轴以 `1/E` 归一，使改变 LoRA 秩或每宗门专家数不会移动激活方差，投影维度可重新配置而无需重训。
+12. **全序列增量解码与停用词前缀扣减（Full-Sequence Incremental Decode with Stop-Prefix Holdback）**：每次推送都重新解码**完整**的累积 token 序列并与上次输出做差分，从而天然免疫 UTF-8 多字节边界拆分；并结合扣减末尾 `len(stops) − 1` 字符，直到停用词被命中或被确定排除为止，确保停用词前缀绝不会先于命中判定到达客户端。
 
 *关于第 3 条的技术澄清：*「100% 原生 Dense 导出」指的是**输出格式**——导出权重可直接作为标准 `Qwen3ForCausalLM` 加载，无需任何自定义代码路径，也不必设置 `trust_remote_code`。它并非「数值完全无损」的断言：导出过程应用了上文声明过的近似（逐 token 的 `w_sci` 冻结为均值、top-k 的稠密集成），其留出集保真度是**经过实测并写入 manifest 的**（当前为 Dense 0.9913 / MoE 0.9988）。完整披露见[烘焙固化为原生架构](#-烘焙固化为原生架构bake_py)。
