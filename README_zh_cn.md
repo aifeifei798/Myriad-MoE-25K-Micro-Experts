@@ -145,12 +145,128 @@ python 4.train_single_cartridge.py
 🔓 [刑满释放] 宗门 #16 [Custom_Rules] 已恢复全额算力！
 ```
 
-### 5. 离线多卡带融合熔铸（`fuse_cartridges.py`）
+### 5. 离线多卡带融合熔铸（`5.fuse_cartridges.py`）
 无需重新训练底座，可将多个独立卡带一键熔铸固化进底座大权重，生成开箱自带全部私有记忆的成品模型：
 ```bash
-python fuse_cartridges.py
+python 5.fuse_cartridges.py
 # 将底座 + cartridge_gongfang.pt (16号槽) 熔铸为 myriad_moe_25k_ultimate_fused.pt
 ```
+
+---
+
+## 🧱 烘焙固化为原生架构（`bake_*.py`）
+
+把微专家增量与文理双大核闭式吸收进**官方标准**权重，导出结果无需 `trust_remote_code`、
+也不依赖 1.54 GB 宿主内存流式层，任何支持该架构的推理框架都能直接加载。
+
+吸收是闭式解。因为增量只落在 `down_proj` 上，底座的 `gate_proj` / `up_proj` 原封不动，
+残差流被精确保留：
+
+```
+ΔW = (YᵀZ)(ZᵀZ + λI)⁻¹      Z = silu(X·Wgᵀ) ⊙ (X·Wuᵀ)
+```
+
+两种输出格式，落盘前均经数值验真：
+
+| 脚本 | 格式 | 参数量 | 留出集保真度 | 备注 |
+| :--- | :--- | ---: | ---: | :--- |
+| `bake_and_merge_dense.py` | `Qwen3ForCausalLM`（原生稠密） | 0.60B | **0.9913** | 最低层 0.9778 |
+| `bake_and_export_moe.py` | `Qwen3MoeForCausalLM`（原生 MoE） | 5.62B | **0.9988** | 最低层 0.9975，`Σ_k w_k = 0.99996` |
+
+```bash
+# Dense —— 单文件自包含，完全不需要 MoE 运行时
+python bake_and_merge_dense.py --output-dir ./qwen_dense
+
+# MoE —— 保留稀疏路由；5.62B 是因为原生 MoE 无权重共享
+python bake_and_export_moe.py --output-dir ./myriad_qwen3_moe
+
+# 强烈建议用真实语料（内置合成语料仅作兜底）
+python bake_and_export_moe.py --calib-file ./my_corpus.txt --output-dir ./out
+
+# 封印宗门 + 预插卡带
+python bake_and_export_moe.py --cage-clusters 12,13 --plug 16=rules.pt --output-dir ./out
+```
+
+两个脚本共用 `bake_common.py`（校准语料、真实前向 hook、闭式求解器、manifest 落盘）。
+每次运行都会写出 `myriad_bake_manifest.json` / `myriad_moe_manifest.json`，记录下方每一条
+声明式近似，以及逐层门控权重与留出集保真度。
+
+### ⚠️ 两个会静默毁掉导出的坑
+
+**1. 目标架构必须匹配底座。** 底座是 Qwen3-0.6B，其注意力带 per-head RMSNorm
+（`q_norm` / `k_norm`）。而 `Qwen2Moe` **没有**这两个模块 —— 硬搬权重会「成功」
+（形状恰好吻合），但归一化被静默丢弃，模型退化成重复 token。
+`bake_and_export_moe.py` 因此以 `Qwen3Moe` 为目标，并断言 `head_dim` 一致。
+Dense 路径不受影响，因为它是原地改底座。
+
+**2. `norm_topk_prob` 必须为 `True`。** 原生 MoE 的输出是 `Σ_k w_k · expert_k(x)`。
+而底座 MLP 被复制进每个 routed expert（这是把增量吸收进 `down_proj` 的唯一办法），
+于是整条稠密底座会被乘上 `Σ_k w_k`。本 checkpoint（top-2 / 20）实测：
+
+| 层 | L0 | L5 | L13 | L27 | 均值 |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| `Σ_k w_k` | 0.185 | 0.231 | 0.438 | 0.757 | **0.40** |
+
+而训练态里稠密底座与 `Δ_sci` 的系数恒为 `1.0`，不归一化就等于丢掉约 60% 的主干。
+置 `norm_topk_prob=True` 后官方会做 `w_k /= Σw_k`，`Σ ≡ 1`，与训练态对齐。
+代价是专家内部的相对权重被重归一化（训练态用原始 softmax 概率）——
+这是标准 MoE 蒸馏固有的取舍，远好过砍掉主干。
+
+### 声明式近似
+
+这些都是真实的降级，不是等价变换，每一条都会写进 manifest：
+
+1. **`w_sci(x)` 是逐 token 门控 → 冻结为实测均值。** 实测该门控在单层内可在
+   0.03~0.99 摆动，属真实降级。可用 `--sci-weight` 覆盖。
+2. **稀疏 top-k。** MoE 导出保留原生稀疏路由；Dense 导出则改为参与宗门等权平均
+   （稠密集成）。
+3. **封印宗门是「移除」而非「偏置」。** 训练态用 `cluster_bias = -1e4` 让槽位不可路由，
+   而原生路由器没有 bias 项，故 `--cage-clusters` 直接把该专家从模型里删掉
+   （索引在 `cluster_order` 中重映射）。
+
+### 校准语料量才是保真度瓶颈
+
+闭式解要解 `[3072, 3072]` 的系统，样本数 `N` 必须显著大于中间维 `I = 3072`。
+两个脚本都会回报该比例，并在**系统欠定**时告警，避免把稀薄语料误当成质量天花板：
+
+```
+✗ 校准样本 53 / 中间维 3072 = 0.02×（严重欠定，保真度数字基本不可信，请务必加大 --calib-tokens）
+✓ 校准样本 8436 / 中间维 3072 = 2.75×
+```
+
+保真度按**留出 20%** 划分测得（按文档顺序切分而非随机），λ 也在同一留出集上择优 ——
+早前版本是固定 λ=1e-4 且在**拟合集**上报，那个数字可被调 λ 修饰，不能当真。
+
+### `--micro-scale` 怎么选
+
+`--micro-scale` 决定注入多少微专家增量。默认 **0.0125**，由 Dense 导出在 27 个
+新写 prompt（不取自校准语料）上扫描 5 档得出，以 4-gram 重复率对未烘焙底座打分：
+
+| `--micro-scale` | 保真度 | rep_rate | vs 底座 | distinct-2 | agree | 与底座完全相同 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| *底座（未烘焙）* | — | 0.2720 | — | 0.6559 | — | — |
+| 0.0000（仅 Δ_sci） | 0.9867 | 0.2746 | +0.0026 | 0.6428 | 0.7940 | 17/27 |
+| **0.0125**（默认） | 0.9913 | **0.2567** | **−0.0153** | 0.6416 | 0.7211 | 14/27 |
+| 0.025 | 0.9935 | 0.3027 | +0.0307 | 0.6057 | 0.5231 | 7/27 |
+| 0.0500 | 0.9950 | 0.3359 | +0.0639 | 0.5842 | 0.3727 | 3/27 |
+| 0.1000 | 0.9958 | 0.3423 | +0.0702 | 0.5520 | 0.2176 | 2/27 |
+
+重新调这个参数前，有两点必须知道：
+
+- **保真度随 `micro_scale` 单调上升，质量却在中间见顶。** 保真度只衡量 Δ 能否被
+  `down_proj` 表达 —— Δ 越大信号越强、越容易被捕捉，对语言质量毫无体现。
+  靠保真度选 `micro_scale` 会一路走到 0.1，即表中最差的一档。
+- **两个目标本质冲突。** 「保住底座能力」与「让微专家行为显形」无法同时最大化。
+  低档位保住模型；高档位让 Δ 显著（与底座一致率降到 0.37 / 0.22），但退化同步加剧。
+  0.0125 是唯一既不劣化重复率、又让 Δ 仍可测的档位 —— `agree` 0.72 说明烘焙后的模型
+  确实不是底座本身。
+
+⚠ **关于上表数据的说明。** 27 个 prompt、贪心解码、单一语料（内置合成那份）。
+0.0125 相对底座那 −0.0153 的优势幅度不大，可能接近噪声底，因此应把它当作
+**合理默认值而非已证实最优**。发布前请用 `--calib-file` 接入真实文本重跑一遍。
+
+MoE 导出采用同样的 0.0125 默认值，便于两种格式直接对照，但它通常无需再调 ——
+它保留了稀疏路由，不存在稠密集成带来的失真。
 
 ---
 
@@ -158,8 +274,8 @@ python fuse_cartridges.py
 
 ### 1. 环境准备
 ```bash
-git clone https://github.com/aifeifei798/Myriad-MoE-25K-Micro-Experts.git
-cd Myriad-MoE-25K-Micro-Experts
+git clone https://github.com/aifeifei798/DualBigLittle-MoE.git
+cd DualBigLittle-MoE
 pip install torch transformers datasets accelerate
 ```
 
@@ -182,6 +298,43 @@ python 3.chat_myriad_25k.py
 # 25,200 个微专家挂载进 1.54 GB 内存，进入带实时监控的交互终端
 ```
 
+### 5. 启动 OpenAI 兼容 API 服务（`7.api_myriad_server.py`）
+将终端的全套能力搬上 HTTP，直接复用 `6.chat_myriad_25k_lora_fast_more_mirco.py` 的推理内核（`forward` 无重复实现）。
+
+```bash
+uv pip install --python .venv/bin/python fastapi "uvicorn[standard]" python-multipart
+python 7.api_myriad_server.py --port 8000 --api-key sk-myriad
+# 可视化看板: http://127.0.0.1:8000/     遥测: /v1/myriad/stats
+```
+
+任何 OpenAI 客户端（`openai`、Cherry Studio、LangChain……）可直接接入：
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="sk-myriad")
+client.chat.completions.create(
+    model="myriad-moe-25k-lora",
+    messages=[{"role": "user", "content": "解释一下快排"}],
+    stream=True,                                   # SSE，并把 reasoning_content 单独拆出
+    extra_body={"myriad": {"focus_clusters": [0, 1, 2]}},   # 按请求限制路由
+)
+```
+
+| 端点 | 用途 |
+| :--- | :--- |
+| `GET /v1/models`、`GET /v1/models/{id}` | 带 Myriad 元数据的模型卡 |
+| `POST /v1/chat/completions` | SSE 流式 + 非流式，标准 `usage` / `finish_reason` / `[DONE]` |
+| `POST /v1/completions` | 传统文本补全 |
+| `GET /v1/myriad/stats`、`POST …/stats/reset` | 全息看板（文理比、20 宗门热力图、显存） |
+| `GET /v1/myriad/catch` | 28 层归因雷达（`/catch`） |
+| `GET`/`POST /v1/myriad/topk` | 单层或全局动态开核（`/show_k`、`/set_k`、`/set_k_all`） |
+| `POST /v1/myriad/clusters/{cid}/cage`·`/free`、`POST /v1/myriad/snipe` | 神经外科手术（`/cage`、`/free`、`/snipe`） |
+| `POST /v1/myriad/cartridge/plug` | 通过 multipart 上传或服务端路径热插卡带（`/plug`） |
+| `POST /v1/myriad/engine` | 切换 CUDA Graph 解码 / 默认回复长度（`/graph`、`/maxlen`） |
+| `GET /v1/myriad/metrics` | JSON 或 `?format=prometheus`（TTFT、tok/s、队列深度） |
+| `GET /` | 浏览器看板，带实时宗门热力图 |
+
+超出 OpenAI 标准 schema 的扩展：`repetition_penalty`、`chat_template_kwargs`（Qwen3 `enable_thinking`）、`split_reasoning`（把 `<think>` 块路由到 `delta.reasoning_content`），以及 `myriad` 块（`focus_clusters`、`top_k`、`stats`、`reset_stats`）用于逐请求神经管控 —— 请求结束后全部自动还原。斜杠指令（`/catch`、`/cage 16`、`/plug x.pt`……）也可直接在对话中使用。
+
 ---
 
 ## 📜 项目里程碑
@@ -192,6 +345,8 @@ python 3.chat_myriad_25k.py
 - [x] **零性能损耗锁页内存流式管线**：实现消费级单卡 30 tokens/s 的异构高速吞吐。
 - [x] **40ms 内存级赛博义体热插拔**：突破传统框架限制，实现原地指针级知识切换。
 - [x] **28 层 CT 级神经内鬼雷达**：实装深层可解释性定位与单点狙击切除工具链。
+- [x] **OpenAI 兼容 API 服务**：可直接对接的 `/v1` 端点，支持逐请求专家路由管控与实时遥测看板。
+- [x] **原生架构烘焙固化**：闭式融合进官方 `Qwen3` / `Qwen3Moe` 权重，零自定义依赖，并经数值验真（留出集保真度 0.9913 / 0.9988）。
 - [ ] **端侧低比特流式量化**：探索面向移动端/嵌入式芯片的 FP8/INT4 异步微专家流式通道。
 
 ---
@@ -216,46 +371,43 @@ python 3.chat_myriad_25k.py
 ## ⚖️ 开源协议
 本项目采用 **[Apache-2.0 开源协议](LICENSE)**。允许学术研究与商业应用，转载或衍生使用请保留原作者署名。
 
-
 ---
 
-## 🔐 接口鉴权与数据复现
+## 🔐 API 权限分级与数据复现
 
-### 令牌分级
+### 密钥分级
 
-| 令牌 | 参数 | 权限 |
+| 密钥 | 参数 | 权限 |
 |---|---|---|
-| 管理员 | `--api-key` | 全部：遥测、神经手术、调频、卡带热插拔、生成 |
-| 只读 | `--read-only-key` | 仅 `GET` 遥测/看板；**一切写操作返回 403** |
+| 管理员 | `--api-key` | 全部功能：遥测、神经外科手术、动态开核、卡带热插拔、生成 |
+| 只读 | `--read-only-key` | 仅 `GET` 遥测/看板；**所有写操作 → 403** |
 
 ```bash
 python 7.api_myriad_server.py --api-key sk-admin --read-only-key sk-viewer
 ```
 
-`GET /v1/models` 会在 `myriad.permission` 中回报调用方等级
-（`admin` / `read` / `anonymous`），并附 `auth_required`、`read_only_available`，
-看板据此把无权使用的控件置灰。
+`GET /v1/models` 会在 `myriad.permission` 中回报调用方身份
+（`admin` / `read` / `anonymous`），并附带 `auth_required` 与 `read_only_available`，
+便于看板前端把无权使用的控件置灰。
 
-设计说明：所有 `/v1/myriad/*` 路由都挂了 `require_engine` 守卫，
-因此在权重加载期间（可能耗时很久）一律返回 **503「模型正在加载中」**，
-而不会因为 `self.model` 还是 `None` 而崩成 500。
-`/v1/models` 与 `/health` 保持可用，客户端才能探测就绪状态。
+设计说明：所有 `/v1/myriad/*` 路由都挂在 `require_engine` 上，因此在（可能较长的）
+权重加载期间它们返回 **503「模型正在加载中」**，而不是以 500 崩溃。
+`/v1/models` 与 `/health` 保持可达，客户端仍可探测就绪状态。
 
 ### 卡带上传限制
 
-`POST /v1/myriad/cartridge/plug` 支持 multipart `file` 上传或服务端 `path`。
-上传大小受 `--max-cartridge-mb` 限制（默认 512MB），超出返回 **413**；
-空内容 400、插槽越界 400、文件不存在 404。
-文件名经 `basename` 净化，不参与任何路径拼接。
+`POST /v1/myriad/cartridge/plug` 支持 multipart `file` 上传或服务端 `path` 两种方式。
+上传体积受 `--max-cartridge-mb` 限制（默认 512），超限返回 **413**；空请求体 → 400，
+槽位越界 → 400，文件不存在 → 404。文件名经 `basename` 净化，绝不参与路径拼接。
 
 ### Web 控制台
 
-前端为独立仓库：**[aifeifei798/myriad-moe-console](https://github.com/aifeifei798/myriad-moe-console)**
+独立前端位于单独仓库：
+**[aifeifei798/myriad-moe-console](https://github.com/aifeifei798/myriad-moe-console)**
 
-### 权重与数据不入库
+### 数据与权重不入 git
 
-单个权重文件 1.6~2.1 GB，训练语料 14 MB，均由 `.gitignore` 排除。
-复现方式：
+单个权重文件 1.6~2.1 GB、训练语料 14 MB，均由 `.gitignore` 排除。复现方式：
 
 ```bash
 python 1.prepare_myriad_data.py      # → myriad_train_data.jsonl（不入库）
@@ -264,4 +416,5 @@ python 4.train_single_cartridge.py   # → cartridge_*.pt
 python 5.fuse_cartridges.py          # → myriad_moe_25k_ultimate_fused.pt
 ```
 
-`custom_data.jsonl`（5 KB 示例）**已入库**，便于快速冒烟测试整条流水线。
+`custom_data.jsonl`（5 KB 示例）**是**入库的，便于快速试跑整条流水线。
+
