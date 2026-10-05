@@ -224,7 +224,7 @@ The closed-form solve is `[3072, 3072]`, so sample count `N` must comfortably ex
 ✓ 校准样本 8436 / 中间维 3072 = 2.75×
 ```
 
-Reported fidelity is measured on a **held-out 20%** split (by document order, not random) with `λ` selected on that same split — an earlier version reported on the fitting set with a fixed `λ`, a number that could be tuned rather than trusted.
+Reported fidelity is measured on a **held-out 20%** split (by document order, not random) with `λ` selected on that same split — an earlier version reported on the fitting set with a fixed `λ = 1e-4`, a number that could be tuned rather than trusted.
 
 ### Choosing `--micro-scale`
 
