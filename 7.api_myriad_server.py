@@ -202,7 +202,17 @@ class ThoughtSplitter:
 
 
 class StopTrimmer:
-    """在线 Stop 序列前瞻检测（防止停用词前缀被提前冲刷至客户端）。"""
+    """在线 Stop 序列前瞻检测（防止停用词前缀被提前冲刷至客户端）。
+
+    问题: 流式解码按 token 推进，stop 词（如 "\\n\\nUser:"）几乎必然被切成
+    若干片分批到达。若见到一片就下发，等 stop 词的前缀（如 "\\n\\nU"）已经
+    进了客户端缓冲区，后面即使命中并截断也撤不回来 —— 用户会看到半截停用词。
+
+    因此这里返回两个量:
+      hit_idx   已完全命中时，命中点的起始下标（由调用方截断收尾）
+      safe_len  未命中时，本次可安全下发的字符长度，已扣掉末尾正在拼装的
+                stop 前缀（len(stops) - 1 字符以内的尾巴一律压住不发）
+    """
 
     def __init__(self, stops: Sequence[str]):
         self.stops = [s for s in (stops or []) if s]
