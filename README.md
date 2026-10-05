@@ -258,6 +258,43 @@ python 3.chat_myriad_25k.py
 # Mounts 25,200 experts into 1.54 GB RAM with real-time cluster telemetry
 ```
 
+### 5. OpenAI-Compatible API Server (`7.api_myriad_server.py`)
+Exposes the full terminal feature set over HTTP, reusing the inference core of `6.chat_myriad_25k_lora_fast_more_mirco.py` verbatim (no `forward` duplication).
+
+```bash
+uv pip install --python .venv/bin/python fastapi "uvicorn[standard]" python-multipart
+python 7.api_myriad_server.py --port 8000 --api-key sk-myriad
+# Live dashboard: http://127.0.0.1:8000/     Telemetry: /v1/myriad/stats
+```
+
+Drop-in for any OpenAI client (`openai`, Cherry Studio, LangChain, …):
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="sk-myriad")
+client.chat.completions.create(
+    model="myriad-moe-25k-lora",
+    messages=[{"role": "user", "content": "Explain quicksort"}],
+    stream=True,                                   # SSE with reasoning_content split-out
+    extra_body={"myriad": {"focus_clusters": [0, 1, 2]}},   # restrict routing per request
+)
+```
+
+| Endpoint | Purpose |
+| :--- | :--- |
+| `GET /v1/models`, `GET /v1/models/{id}` | Model cards with Myriad metadata |
+| `POST /v1/chat/completions` | Streaming SSE + non-streaming, standard `usage` / `finish_reason` / `[DONE]` |
+| `POST /v1/completions` | Legacy text completion |
+| `GET /v1/myriad/stats`, `POST …/stats/reset` | Holographic dashboard (Arts/STEM ratio, 20-cluster heatmap, VRAM) |
+| `GET /v1/myriad/catch` | 28-layer attribution radar (`/catch`) |
+| `GET`/`POST /v1/myriad/topk` | Per-layer or global dynamic kernel count (`/show_k`, `/set_k`, `/set_k_all`) |
+| `POST /v1/myriad/clusters/{cid}/cage`·`/free`, `POST /v1/myriad/snipe` | Neuro-surgery (`/cage`, `/free`, `/snipe`) |
+| `POST /v1/myriad/cartridge/plug` | Hot-swap a cartridge via multipart upload or server path (`/plug`) |
+| `POST /v1/myriad/engine` | Toggle CUDA Graph decoding / default reply length (`/graph`, `/maxlen`) |
+| `GET /v1/myriad/metrics` | JSON or `?format=prometheus` (TTFT, tok/s, queue depth) |
+| `GET /` | Browser dashboard with live cluster heatmap |
+
+Extensions beyond the OpenAI schema: `repetition_penalty`, `chat_template_kwargs` (Qwen3 `enable_thinking`), `split_reasoning` (routes `<think>` blocks into `delta.reasoning_content`), and the `myriad` block (`focus_clusters`, `top_k`, `stats`, `reset_stats`) for per-request neural control — all reverted automatically when the request ends. Slash commands (`/catch`, `/cage 16`, `/plug x.pt`, …) also work directly in chat.
+
 ---
 
 ## 📜 Repository Roadmap
@@ -268,6 +305,7 @@ python 3.chat_myriad_25k.py
 - [x] **Zero-Penalty Host Pinned Streaming**: Pinned memory DMA pipeline yielding 30 tokens/s on consumer hardware.
 - [x] **In-Memory Dynamic Hot-Plugging**: 44 ms live mutation via volatile memory tensor swap.
 - [x] **Per-Layer Attribution & Diagnostic Radar**: 28-layer inspection and dynamic expert isolation.
+- [x] **OpenAI-Compatible API Server**: Drop-in `/v1` endpoint with per-request expert routing control and live telemetry dashboard.
 - [x] **Stock-Architecture Baking**: Closed-form fusion into official `Qwen3` / `Qwen3Moe` weights — zero custom dependencies, verified numerically (0.9935 / 0.9988 held-out fidelity).
 - [ ] **Low-Precision Streaming**: Porting micro-expert DMA streams to FP8/INT4 for embedded edge accelerators.
 
