@@ -153,10 +153,10 @@ When unexpected or over-indexed behavior is observed, pinpoint the responsible l
 🔓 [Restored] Cluster #16 [Custom_Rules] restored to full compute capacity.
 ```
 
-### 5. Offline Multi-Cartridge Fusion (`fuse_cartridges.py`)
+### 5. Offline Multi-Cartridge Fusion (`5.fuse_cartridges.py`)
 Permanently fuse arbitrary cartridges into a standalone unified checkpoint without retraining the base weights:
 ```bash
-python fuse_cartridges.py
+python 5.fuse_cartridges.py
 # Fuses base weights + cartridge_gongfang.pt (Slot 16) -> myriad_moe_25k_ultimate_fused.pt
 ```
 
