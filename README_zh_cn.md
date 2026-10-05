@@ -418,3 +418,15 @@ python 5.fuse_cartridges.py          # → myriad_moe_25k_ultimate_fused.pt
 
 `custom_data.jsonl`（5 KB 示例）**是**入库的，便于快速试跑整条流水线。
 
+
+---
+
+## 📜 现有技术公开（Public Prior Art & Disclosures）
+为避免模块化边缘 MoE 系统被专利垄断，本项目主动公开以下技术：
+
+1. **三层次级 MoE（Tri-Tier Hierarchical MoE）**：冻结的原生稠密语言底座（L0），叠加正交的大核 LoRA（L1）与动态路由的微专家阵列（L2）。
+2. **零拷贝视图存储共享（Zero-Copy View Storage Sharing）**：将 3D/4D 微专家张量权重扁平化为共享同一底层显存的 2D 内存视图，从而支持原地封印（caging）、单层狙击（sniping）与卡带热插拔，且不会使静态 CUDA Graph 失效。
+3. **闭式 Ridge 特征投影（Closed-Form Ridge Feature Projection）**：一套通过岭回归把线性残差 LoRA 增量吸收进标准 SwiGLU down-projection 权重的数学框架，使 100% 原生 Dense 导出成为可能。
+4. **解耦式异步槽位回收（Decoupled Asynchronous Slot Reaping）**：用解耦的后台协程守护 CUDA Graph 执行队列，避免 HTTP 取消时信号量被过早释放。
+
+*关于第 3 条的技术澄清：*「100% 原生 Dense 导出」指的是**输出格式**——导出权重可直接作为标准 `Qwen3ForCausalLM` 加载，无需任何自定义代码路径，也不必设置 `trust_remote_code`。它并非「数值完全无损」的断言：导出过程应用了上文声明过的近似（逐 token 的 `w_sci` 冻结为均值、top-k 的稠密集成），其留出集保真度是**经过实测并写入 manifest 的**（当前为 Dense 0.9913 / MoE 0.9988）。完整披露见[烘焙固化为原生架构](#-烘焙固化为原生架构bake_py)。

@@ -403,3 +403,15 @@ python 5.fuse_cartridges.py          # → myriad_moe_25k_ultimate_fused.pt
 ```
 
 `custom_data.jsonl` (5 KB sample) **is** committed so the pipeline can be smoke-tested.
+
+---
+
+## 📜 Public Prior Art & Disclosures (现有技术公开)
+To prevent patent monopolies on modular edge MoE systems, this project openly discloses:
+
+1. **Tri-Tier Hierarchical MoE**: A frozen native dense linguistic base (L0) combined with orthogonal macro-LoRA cores (L1) and dynamically routed micro-expert arrays (L2).
+2. **Zero-Copy View Storage Sharing**: Flattening 3D/4D micro-expert tensor weights into 2D memory views sharing underlying GPU storage, allowing in-place caging, sniping, and cartridge hot-plugging without invalidating static CUDA Graphs.
+3. **Closed-Form Ridge Feature Projection**: A mathematical framework absorbing linear residual LoRA deltas into standard SwiGLU down-projection weights via ridge regression, enabling 100% native Dense export.
+4. **Decoupled Asynchronous Slot Reaping**: Using decoupled background coroutines to safeguard CUDA Graph execution queues against premature semaphore release during HTTP cancellations.
+
+*Technical clarification on item 3:* "100% native Dense export" refers to the **output format** — the exported weights load as stock `Qwen3ForCausalLM` with no custom code path and no `trust_remote_code`. It is not a claim of lossless numerical equivalence: the export applies the approximations declared above (per-token `w_sci` frozen to its mean, dense ensembling of top-k), and its held-out fidelity is **measured and recorded in the manifest** (currently 0.9913 Dense / 0.9988 MoE). See [Baking to Standard Architectures](#-baking-to-standard-architectures-bake_py) for the full disclosure.
