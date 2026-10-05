@@ -1011,17 +1011,10 @@ app = FastAPI(title="Myriad-MoE OpenAI-Compatible API", version="1.0.0",
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
-def require_auth(authorization: Optional[str] = Header(default=None)):
-    key = getattr(getattr(engine, "args", None), "api_key", None)
-    if not key:
-        return
-    token = (authorization or "").removeprefix("Bearer ").strip()
-    if token != key:
-        raise HTTPException(status_code=401, detail="Invalid API key",
-                            headers={"WWW-Authenticate": "Bearer"})
-
-
-auth = [Depends(require_auth)]
+# ── 权限分级：只读 token 可查看看板，但不能做神经手术或消耗算力生成 ──
+ROLE_ADMIN = "admin"
+ROLE_READ = "read"
+ROLE_ANON = "anonymous"
 
 
 def require_engine():
@@ -1041,6 +1034,47 @@ def require_engine():
 
 
 guard = [Depends(require_engine)]
+
+
+def _keys():
+    a = getattr(engine, "args", None)
+    return (getattr(a, "api_key", None),
+            getattr(a, "read_only_key", None))
+
+
+def resolve_role(authorization: Optional[str]) -> str:
+    """判定当前 token 的权限等级。未开启鉴权时一律 admin（保持旧行为）。"""
+    admin_key, read_key = _keys()
+    if not admin_key and not read_key:
+        return ROLE_ANON
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    if admin_key and token == admin_key:
+        return ROLE_ADMIN
+    if read_key and token == read_key:
+        return ROLE_READ
+    raise HTTPException(status_code=401, detail="Invalid API key",
+                        headers={"WWW-Authenticate": "Bearer"})
+
+
+def require_auth(authorization: Optional[str] = Header(default=None)) -> str:
+    """兼容旧签名的鉴权依赖，保留给非分级场景；返回值忽略。"""
+    resolve_role(authorization)
+    return authorization or ""
+
+
+def require_admin(authorization: Optional[str] = Header(default=None)) -> str:
+    """写操作守卫：只读 token 一律 403。"""
+    role = resolve_role(authorization)
+    if role == ROLE_READ:
+        raise HTTPException(
+            status_code=403,
+            detail="当前为只读令牌 (read-only)，禁止执行写操作。"
+                   "如需神经手术/生成，请改用 --api-key 的管理员令牌。")
+    return authorization or ""
+
+
+admin = [Depends(require_admin)]
+auth = [Depends(require_auth)]
 
 
 def _resolve_params(req: MyriadChatRequest) -> GenParams:
@@ -1095,26 +1129,32 @@ def _sse(payload: dict) -> str:
 
 # ──────────────────────────────────────────────────────── OpenAI 兼容端点
 @app.get("/v1/models", dependencies=auth)
-async def list_models():
+async def list_models(authorization: Optional[str] = Header(default=None)):
     info = engine.dashboard() if engine.ready else {}
+    role = resolve_role(authorization)
+    admin_key, read_key = _keys()
     return {"object": "list", "data": [{
         "id": SERVED_MODEL_ID, "object": "model", "created": int(time.time()),
         "owned_by": "feifei", "root": SERVED_MODEL_ID, "parent": None, "permission": [],
         "max_model_len": 32768,
         "myriad": {"base_model": engine.model_id, "layers": info.get("layers"),
                    "clusters": engine.num_clusters,
-                   "experts": info.get("total_experts"), "cuda_graph": info.get("cuda_graph")},
+                   "experts": info.get("total_experts"), "cuda_graph": info.get("cuda_graph"),
+                   # 客户端据此决定是否禁用写操作按钮 / 提示「只读模式」
+                   "permission": role,
+                   "auth_required": bool(admin_key or read_key),
+                   "read_only_available": bool(read_key)},
     }]}
 
 
 @app.get("/v1/models/{model_id}", dependencies=auth)
-async def get_model(model_id: str):
+async def get_model(model_id: str, authorization: Optional[str] = Header(default=None)):
     if model_id not in (SERVED_MODEL_ID, engine.model_id):
         raise HTTPException(status_code=404, detail=f"model '{model_id}' not found")
-    return (await list_models())["data"][0]
+    return (await list_models(authorization))["data"][0]
 
 
-@app.post("/v1/chat/completions", dependencies=auth)
+@app.post("/v1/chat/completions", dependencies=admin)
 async def chat_completions(req: MyriadChatRequest):
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages 不能为空")
@@ -1250,7 +1290,7 @@ async def _chat_stream(req, input_ids, params: GenParams, focus, top_k, reset):
     yield "data: [DONE]\n\n"
 
 
-@app.post("/v1/completions", dependencies=auth)
+@app.post("/v1/completions", dependencies=admin)
 async def completions(req: MyriadCompletionRequest):
     if not engine.ready:
         raise HTTPException(status_code=503, detail=engine.startup_error or "模型尚未就绪")
@@ -1291,7 +1331,7 @@ async def stats():
     return engine.dashboard()
 
 
-@app.post("/v1/myriad/stats/reset", dependencies=auth + guard)
+@app.post("/v1/myriad/stats/reset", dependencies=admin + guard)
 async def stats_reset():
     engine.reset_stats()
     return {"object": "myriad.stats.reset", "ok": True, "message": "🧹 统计已清零"}
@@ -1328,7 +1368,7 @@ async def get_topk():
         for i, l in enumerate(engine.layers)]}
 
 
-@app.post("/v1/myriad/topk", dependencies=auth + guard)
+@app.post("/v1/myriad/topk", dependencies=admin + guard)
 async def set_topk(body: TopKBody):
     try:
         res = engine.set_top_k(body.layer, body.k)
@@ -1337,7 +1377,7 @@ async def set_topk(body: TopKBody):
     return {"object": "myriad.topk.updated", **res}
 
 
-@app.post("/v1/myriad/clusters/{cid}/cage", dependencies=auth + guard)
+@app.post("/v1/myriad/clusters/{cid}/cage", dependencies=admin + guard)
 async def cage_cluster(cid: int):
     try:
         res = engine.cage(cid)
@@ -1346,7 +1386,7 @@ async def cage_cluster(cid: int):
     return {"object": "myriad.cluster.caged", **res}
 
 
-@app.post("/v1/myriad/clusters/{cid}/free", dependencies=auth + guard)
+@app.post("/v1/myriad/clusters/{cid}/free", dependencies=admin + guard)
 async def free_cluster(cid: int, layer: Optional[int] = None):
     """layer 省略 = 整宗释放（向后兼容）；指定 layer = 仅解封该层，用于单层狙击的单点撤销。"""
     try:
@@ -1357,7 +1397,7 @@ async def free_cluster(cid: int, layer: Optional[int] = None):
     return {"object": obj, **res}
 
 
-@app.post("/v1/myriad/snipe", dependencies=auth + guard)
+@app.post("/v1/myriad/snipe", dependencies=admin + guard)
 async def snipe_cluster(body: SnipeBody):
     try:
         res = engine.snipe(body.layer, body.cluster)
@@ -1366,26 +1406,49 @@ async def snipe_cluster(body: SnipeBody):
     return {"object": "myriad.cluster.sniped", **res}
 
 
-@app.post("/v1/myriad/cartridge/plug", dependencies=auth + guard)
+@app.post("/v1/myriad/cartridge/plug", dependencies=admin + guard)
 async def plug_cartridge(file: Optional[UploadFile] = File(None),
                          path: Optional[str] = Form(None),
                          slot: int = Form(16)):
     if file is None and not path:
         raise HTTPException(status_code=400, detail="请提供 file (.pt) 或 path")
+    if not (0 <= slot < getattr(engine, "num_clusters", 20)):
+        raise HTTPException(status_code=400,
+                            detail=f"插槽编号需在 0 ~ {engine.num_clusters - 1} 之间")
+
+    # 先按 Content-Length 粗筛，避免超大文件直接进内存
+    max_mb = getattr(engine.args, "max_cartridge_mb", 512)
+    if file is not None:
+        limit = max(1, int(max_mb)) * 1024 * 1024
+        declared = file.size or 0
+        if declared and declared > limit:
+            raise HTTPException(status_code=413,
+                                detail=f"卡带过大: {declared / 2**20:.1f} MB > 上限 {max_mb} MB")
+
     try:
         if file is not None:
-            res = engine.plug_cartridge(file.file, slot, file.filename)
+            # 文件名只用于展示与记录，不参与任何路径拼接；仍然做一次净化
+            safe_name = os.path.basename(str(file.filename or "uploaded.pt"))[:128]
+            blob = await file.read()
+            if len(blob) > limit:
+                raise HTTPException(status_code=413,
+                                    detail=f"卡带过大: {len(blob) / 2**20:.1f} MB > 上限 {max_mb} MB")
+            if not blob:
+                raise HTTPException(status_code=400, detail="上传内容为空")
+            res = engine.plug_cartridge(io.BytesIO(blob), slot, safe_name)
         else:
             res = engine.plug_cartridge(path, slot, path)
     except HTTPException:
         raise
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"卡带植入失败: {exc}") from exc
     LOG.info("⚡ 卡带《%s》植入插槽 #%02d (%.2f ms)", res["name"], res["slot"], res["elapsed_ms"])
     return {"object": "myriad.cartridge.plugged", **res}
 
 
-@app.post("/v1/myriad/engine", dependencies=auth + guard)
+@app.post("/v1/myriad/engine", dependencies=admin + guard)
 async def set_engine(body: EngineBody):
     return {"object": "myriad.engine", **engine.set_engine(body.cuda_graph, body.max_len)}
 
@@ -1486,7 +1549,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--no-graph", action="store_true", help="禁用 CUDA Graph (普通 eager 解码)")
     p.add_argument("--max-len", type=int, default=512, help="默认最大回复 token 数")
     p.add_argument("--api-key", default=os.getenv("MYRIAD_API_KEY"),
-                   help="设置后需 Authorization: Bearer <key>")
+                   help="管理员令牌, 拥有全部权限 (含神经手术与生成)")
+    p.add_argument("--read-only-key", default=os.getenv("MYRIAD_READ_ONLY_KEY"),
+                   help="只读令牌: 仅可 GET 遥测/看板, 写操作一律 403")
+    p.add_argument("--max-cartridge-mb", type=int,
+                   default=int(os.getenv("MYRIAD_MAX_CARTRIDGE_MB", 512)),
+                   help="卡带上传大小上限 (MB), 超出直接 413")
     p.add_argument("--plug", action="append", metavar="[slot=]path.pt",
                    help="启动时热插拔卡带, 可重复, 例: --plug 16=cartridge_gongfang.pt")
     p.add_argument("--log-level", default=os.getenv("MYRIAD_LOG_LEVEL", "info"))

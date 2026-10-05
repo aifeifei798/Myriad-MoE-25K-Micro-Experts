@@ -223,3 +223,54 @@ If you use this architecture, the streaming micro-expert design, or the empirica
 
 ## ⚖️ License
 Released under the **[Apache-2.0 License](LICENSE)**. Free for academic research and commercial applications with proper attribution.
+
+---
+
+## 🔐 API Access Control & Data Reproduction
+
+### Token tiers
+
+| Token | Flag | Permissions |
+|---|---|---|
+| Admin | `--api-key` | Everything: telemetry, neuro-surgery, top-k, cartridge plug, generation |
+| Read-only | `--read-only-key` | `GET` telemetry/dashboard only; **all writes → 403** |
+
+```bash
+python 7.api_myriad_server.py --api-key sk-admin --read-only-key sk-viewer
+```
+
+`GET /v1/models` reports the caller's tier under `myriad.permission`
+(`admin` / `read` / `anonymous`) plus `auth_required` and `read_only_available`,
+so a dashboard client can grey out controls it may not use.
+
+Design note: every `/v1/myriad/*` route is gated on `require_engine`, so during
+the (potentially long) weight load they answer **503 "模型正在加载中"** rather
+than crashing with a 500. `/v1/models` and `/health` stay reachable so clients
+can still detect readiness.
+
+### Cartridge upload limits
+
+`POST /v1/myriad/cartridge/plug` accepts either a multipart `file` upload or a
+server-side `path`. Uploads are capped by `--max-cartridge-mb` (default 512) and
+return **413** when exceeded; empty bodies → 400, out-of-range slots → 400,
+missing files → 404. Filenames are sanitised with `basename` and never used in
+path construction.
+
+### Web console
+
+A dedicated front-end lives in a separate repository:
+**[aifeifei798/myriad-moe-console](https://github.com/aifeifei798/myriad-moe-console)**
+
+### Data & weights are not in git
+
+Weight files are 1.6–2.1 GB each and the training corpus is 14 MB, so they are
+excluded by `.gitignore`. To rebuild:
+
+```bash
+python 1.prepare_myriad_data.py      # → myriad_train_data.jsonl (not committed)
+python 2.train_myriad_25k.py         # → myriad_moe_25k_weights.pt
+python 4.train_single_cartridge.py   # → cartridge_*.pt
+python 5.fuse_cartridges.py          # → myriad_moe_25k_ultimate_fused.pt
+```
+
+`custom_data.jsonl` (5 KB sample) **is** committed so the pipeline can be smoke-tested.

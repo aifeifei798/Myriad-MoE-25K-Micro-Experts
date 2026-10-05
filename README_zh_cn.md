@@ -216,3 +216,52 @@ python 3.chat_myriad_25k.py
 ## ⚖️ 开源协议
 本项目采用 **[Apache-2.0 开源协议](LICENSE)**。允许学术研究与商业应用，转载或衍生使用请保留原作者署名。
 
+
+---
+
+## 🔐 接口鉴权与数据复现
+
+### 令牌分级
+
+| 令牌 | 参数 | 权限 |
+|---|---|---|
+| 管理员 | `--api-key` | 全部：遥测、神经手术、调频、卡带热插拔、生成 |
+| 只读 | `--read-only-key` | 仅 `GET` 遥测/看板；**一切写操作返回 403** |
+
+```bash
+python 7.api_myriad_server.py --api-key sk-admin --read-only-key sk-viewer
+```
+
+`GET /v1/models` 会在 `myriad.permission` 中回报调用方等级
+（`admin` / `read` / `anonymous`），并附 `auth_required`、`read_only_available`，
+看板据此把无权使用的控件置灰。
+
+设计说明：所有 `/v1/myriad/*` 路由都挂了 `require_engine` 守卫，
+因此在权重加载期间（可能耗时很久）一律返回 **503「模型正在加载中」**，
+而不会因为 `self.model` 还是 `None` 而崩成 500。
+`/v1/models` 与 `/health` 保持可用，客户端才能探测就绪状态。
+
+### 卡带上传限制
+
+`POST /v1/myriad/cartridge/plug` 支持 multipart `file` 上传或服务端 `path`。
+上传大小受 `--max-cartridge-mb` 限制（默认 512MB），超出返回 **413**；
+空内容 400、插槽越界 400、文件不存在 404。
+文件名经 `basename` 净化，不参与任何路径拼接。
+
+### Web 控制台
+
+前端为独立仓库：**[aifeifei798/myriad-moe-console](https://github.com/aifeifei798/myriad-moe-console)**
+
+### 权重与数据不入库
+
+单个权重文件 1.6~2.1 GB，训练语料 14 MB，均由 `.gitignore` 排除。
+复现方式：
+
+```bash
+python 1.prepare_myriad_data.py      # → myriad_train_data.jsonl（不入库）
+python 2.train_myriad_25k.py         # → myriad_moe_25k_weights.pt
+python 4.train_single_cartridge.py   # → cartridge_*.pt
+python 5.fuse_cartridges.py          # → myriad_moe_25k_ultimate_fused.pt
+```
+
+`custom_data.jsonl`（5 KB 示例）**已入库**，便于快速冒烟测试整条流水线。

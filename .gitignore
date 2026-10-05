@@ -1,0 +1,54 @@
+# ── 模型权重与大型数据：绝不入库 ──
+# 单个权重文件 1.6~2.1 GB，训练数据 14 MB，直接提交会让仓库不可用。
+# 生成方式见 README「数据与权重复现」一节。
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.gguf
+*.npz
+*.npy
+*.h5
+*.msgpack
+
+# 训练/中间数据
+# 注意：gitignore 不支持行尾注释，`!x # 说明` 会被当成整个 pattern 而永不匹配。
+*.jsonl
+# 8 KB 的示例数据，保留以便快速试跑
+!custom_data.jsonl
+data/
+datasets/
+outputs/
+runs/
+checkpoints/
+logs/
+wandb/
+
+# 训练产物与缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+.mypy_cache/
+.ruff_cache/
+
+# 环境
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# 前端子项目（独立仓库）
+myriad-moe-神经透视控制台/
+*.zip
