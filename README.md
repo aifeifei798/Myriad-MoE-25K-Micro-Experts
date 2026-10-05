@@ -162,6 +162,74 @@ python fuse_cartridges.py
 
 ---
 
+## 🧱 Baking to Standard Architectures (`bake_*.py`)
+
+Fuse the micro-expert deltas and the dual cores into **stock** model weights, so the result loads anywhere without `trust_remote_code` and without the 1.54 GB host-RAM streaming layer.
+
+The absorption is closed-form. Because the delta only ever lands on `down_proj`, the base `gate_proj` / `up_proj` survive untouched and the residual stream is preserved exactly:
+
+```
+ΔW = (YᵀZ)(ZᵀZ + λI)⁻¹      Z = silu(X·Wgᵀ) ⊙ (X·Wuᵀ)
+```
+
+Two output formats, both verified numerically before they are written to disk:
+
+| Script | Format | Params | Held-out fidelity | Notes |
+| :--- | :--- | :---: | :---: | :--- |
+| `bake_and_merge_dense.py` | `Qwen3ForCausalLM` (stock dense) | 0.60B | **0.9935** | Lowest layer 0.9833 |
+| `bake_and_export_moe.py` | `Qwen3MoeForCausalLM` (stock MoE) | 5.62B | **0.9988** | Lowest layer 0.9975, `Σ_k w_k = 0.99996` |
+
+```bash
+# Dense — one self-contained file, no MoE runtime at all
+python bake_and_merge_dense.py --output-dir ./qwen_dense
+
+# MoE — keeps sparse routing; 5.62B because stock MoE has no weight sharing
+python bake_and_export_moe.py --output-dir ./myriad_qwen3_moe
+
+# Real corpus strongly recommended (built-in synthetic is only a fallback)
+python bake_and_export_moe.py --calib-file ./my_corpus.txt --output-dir ./out
+
+# Seal clusters, plug a cartridge, pre-bake
+python bake_and_export_moe.py --cage-clusters 12,13 --plug 16=rules.pt --output-dir ./out
+```
+
+Both scripts share `bake_common.py` (calibration corpus, real-forward hooks, closed-form solver, manifest). Each run writes `myriad_bake_manifest.json` / `myriad_moe_manifest.json` recording every approximation below, plus per-layer gating weights and held-out fidelity.
+
+### ⚠️ Two things that will silently ruin the export
+
+**1. The target architecture must match the base.** The base is Qwen3-0.6B, whose attention carries per-head RMSNorm (`q_norm` / `k_norm`). `Qwen2Moe` has **no such modules** — copying the weights anyway succeeds silently (the shapes line up) but drops the normalization and the model degenerates into repeated tokens. `bake_and_export_moe.py` targets `Qwen3Moe` for exactly this reason and asserts `head_dim` agreement. The Dense path is unaffected because it edits the base in place.
+
+**2. `norm_topk_prob` must be `True`.** Stock MoE emits `Σ_k w_k · expert_k(x)`. Since the base MLP is replicated into every routed expert (the only way to absorb a delta into `down_proj`), that scales the *entire dense core* by `Σ_k w_k`. Measured on this checkpoint (top-2 of 20):
+
+| Layer | L0 | L5 | L13 | L27 | mean |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| `Σ_k w_k` | 0.185 | 0.231 | 0.438 | 0.757 | **0.40** |
+
+Training-time coefficients on the dense core and `Δ_sci` are hard-wired to `1.0`, so shipping without normalization discards ~60% of the core. `norm_topk_prob=True` renormalizes to `Σ ≡ 1`, matching training. The cost is that intra-expert relative weights get renormalized (training uses raw softmax) — the standard MoE distillation trade-off, far better than severing the backbone.
+
+### Declared approximations
+
+These are real degradations, not equivalences, and each is recorded in the manifest:
+
+1. **`w_sci(x)` is a per-token gate → frozen to its measured mean.** Measured swing within a single layer is 0.03–0.99, so this is a genuine downgrade. Override with `--sci-weight`.
+2. **Sparse top-k.** The MoE export keeps stock routing; the Dense export instead averages all active clusters equally (dense ensembling).
+3. **Sealed clusters are removed, not biased.** Training seals a slot via `cluster_bias = -1e4`; stock routers have no bias term, so `--cage-clusters` removes the expert outright (indices remapped in `cluster_order`).
+
+### Calibration corpus size is the fidelity bottleneck
+
+The closed-form solve is `[3072, 3072]`, so sample count `N` must comfortably exceed the intermediate dimension `I = 3072`. Both scripts report the ratio and **warn when the system is underdetermined**, so a thin corpus can never be mistaken for a quality ceiling:
+
+```
+✗ 校准样本 53 / 中间维 3072 = 0.02×（严重欠定，保真度数字基本不可信，请务必加大 --calib-tokens）
+✓ 校准样本 8436 / 中间维 3072 = 2.75×
+```
+
+Reported fidelity is measured on a **held-out 20%** split (by document order, not random) with `λ` selected on that same split — an earlier version reported on the fitting set with a fixed `λ`, a number that could be tuned rather than trusted.
+
+---
+
+---
+
 ## 🚀 Quickstart Pipeline
 
 ### 1. Environment Setup
@@ -200,6 +268,7 @@ python 3.chat_myriad_25k.py
 - [x] **Zero-Penalty Host Pinned Streaming**: Pinned memory DMA pipeline yielding 30 tokens/s on consumer hardware.
 - [x] **In-Memory Dynamic Hot-Plugging**: 44 ms live mutation via volatile memory tensor swap.
 - [x] **Per-Layer Attribution & Diagnostic Radar**: 28-layer inspection and dynamic expert isolation.
+- [x] **Stock-Architecture Baking**: Closed-form fusion into official `Qwen3` / `Qwen3Moe` weights — zero custom dependencies, verified numerically (0.9935 / 0.9988 held-out fidelity).
 - [ ] **Low-Precision Streaming**: Porting micro-expert DMA streams to FP8/INT4 for embedded edge accelerators.
 
 ---
