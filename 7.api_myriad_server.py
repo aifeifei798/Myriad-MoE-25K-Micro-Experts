@@ -513,6 +513,10 @@ class MyriadEngine:
             "slot_state": "busy" if self.gate.locked() else "idle",
             "slot_holder": self._slot_holder,
             "caged_clusters": sorted(self._caged.keys()),
+            # 每个在押宗门实际被封杀的层号集合。cage() 会写入全部层 (=全局禁闭),
+            # snipe(layer, cid) 只写入单层 (=单层狙击)。客户端据此区分两种来源。
+            # 注意 free(cid) 总是整宗释放, 因此释放后该键会整体消失。
+            "caged_layer_map": {str(c): sorted(d.keys()) for c, d in self._caged.items()},
             "plugged_cartridges": {str(k): v for k, v in self._plugged.items()},
             "vram": vram, "metrics": self.metrics.snapshot(),
         }
@@ -553,18 +557,43 @@ class MyriadEngine:
                 "caged_layers": len(stash)}
 
     @torch.no_grad()
-    def free(self, cid: int):
+    def free(self, cid: int, layer: Optional[int] = None):
+        """释放宗门。layer=None 整宗释放；指定 layer 则只恢复该层（单层狙击的单点解封）。"""
         self._check_cluster(cid)
         if cid not in self._caged:
             raise ValueError(f"宗门 #{cid:02d} 并未被关押")
-        for i, l in enumerate(self.layers):
-            _, b = self._expert_tensors(l.mlp)
-            saved = self._caged[cid].get(i)
-            if saved is not None:
-                b[cid].copy_(saved)
-            l.mlp.set_caged([cid], False)
-        del self._caged[cid]
-        return {"cluster": cid, "name": self.cluster_names[cid]}
+        stash = self._caged[cid]
+
+        if layer is None:
+            for i, l in enumerate(self.layers):
+                _, b = self._expert_tensors(l.mlp)
+                saved = stash.get(i)
+                if saved is not None:
+                    b[cid].copy_(saved)
+                l.mlp.set_caged([cid], False)
+            released = sorted(stash.keys())
+            del self._caged[cid]
+            return {"cluster": cid, "name": self.cluster_names[cid],
+                    "released_layers": released, "fully_released": True,
+                    "still_caged_layers": []}
+
+        layer = int(layer)
+        if not (0 <= layer < len(self.layers)):
+            raise ValueError(f"层号需在 0 ~ {len(self.layers) - 1} 之间")
+        if layer not in stash:
+            raise ValueError(f"宗门 #{cid:02d} 在第 {layer} 层并未被封杀")
+
+        # 只恢复这一层的权重与路由偏置，其余层保持封杀
+        _, b = self._expert_tensors(self.layers[layer].mlp)
+        b[cid].copy_(stash.pop(layer))
+        self.layers[layer].mlp.set_caged([cid], False)
+        # 该宗门已无任何层被封杀 → 从禁闭名单整体摘除
+        fully_released = not stash
+        if fully_released:
+            del self._caged[cid]
+        return {"cluster": cid, "name": self.cluster_names[cid],
+                "released_layers": [layer], "fully_released": fully_released,
+                "still_caged_layers": sorted(stash.keys())}
 
     @torch.no_grad()
     def snipe(self, layer: int, cid: int):
@@ -995,6 +1024,25 @@ def require_auth(authorization: Optional[str] = Header(default=None)):
 auth = [Depends(require_auth)]
 
 
+def require_engine():
+    """守卫：模型未加载完成时统一返回 503。
+
+    没有这层守卫时，权重加载期间访问 /v1/myriad/* 会走到
+    engine.dashboard() → self.layers → self.model.model.layers，
+    而 self.model 在 load() 完成前是 None，于是抛 AttributeError 变成 500。
+    500 对客户端毫无信息量（无法区分「服务坏了」和「还在启动」），
+    503 + 明确文案才能让客户端正确显示「加载中」。
+    """
+    if engine is None:
+        raise HTTPException(status_code=503, detail="引擎尚未创建")
+    if not engine.ready:
+        detail = engine.startup_error or f"模型正在加载中 ({engine.model_id})，请稍候重试"
+        raise HTTPException(status_code=503, detail=detail)
+
+
+guard = [Depends(require_engine)]
+
+
 def _resolve_params(req: MyriadChatRequest) -> GenParams:
     max_new = req.max_completion_tokens or req.max_tokens or engine.args.max_len
     rep = req.repetition_penalty
@@ -1191,6 +1239,14 @@ async def _chat_stream(req, input_ids, params: GenParams, focus, top_k, reset):
                     "system_fingerprint": "myriad-v1"})
     dur = time.perf_counter() - t_start
     engine.metrics.observe(ttft, dur, usage["prompt_tokens"], usage["completion_tokens"])
+    # 本次问答专属的全息遥测。此前只有非流式路径下发 (_telemetry 在 _chat_nonstream 里)，
+    # 导致 stream=true 时客户端永远拿不到 arts/sci 占比与本轮命中宗门。
+    # 放在 metrics.observe 之后，保证 tokens 等累计值已包含本次请求。
+    telemetry = _telemetry(getattr(req, "myriad", None)) if not failed else {}
+    if telemetry:
+        yield _sse({"id": cid, "object": "chat.completion.chunk", "created": created,
+                    "model": req.model, "system_fingerprint": "myriad-v1",
+                    "choices": [], "usage": usage, "myriad": telemetry})
     yield "data: [DONE]\n\n"
 
 
@@ -1230,18 +1286,18 @@ async def completions(req: MyriadCompletionRequest):
 
 
 # ────────────────────────────────────────────────────── Myriad 特色管理端点
-@app.get("/v1/myriad/stats", dependencies=auth)
+@app.get("/v1/myriad/stats", dependencies=auth + guard)
 async def stats():
     return engine.dashboard()
 
 
-@app.post("/v1/myriad/stats/reset", dependencies=auth)
+@app.post("/v1/myriad/stats/reset", dependencies=auth + guard)
 async def stats_reset():
     engine.reset_stats()
     return {"object": "myriad.stats.reset", "ok": True, "message": "🧹 统计已清零"}
 
 
-@app.get("/v1/myriad/catch", dependencies=auth)
+@app.get("/v1/myriad/catch", dependencies=auth + guard)
 async def catch_radar():
     out = []
     for i, l in enumerate(engine.layers):
@@ -1257,14 +1313,14 @@ async def catch_radar():
             "top_clusters": engine.dashboard()["top_clusters"]}
 
 
-@app.get("/v1/myriad/clusters", dependencies=auth)
+@app.get("/v1/myriad/clusters", dependencies=auth + guard)
 async def clusters():
     d = engine.dashboard()
     return {"object": "list", "data": d["per_cluster"],
             "caged": d["caged_clusters"], "plugged": d["plugged_cartridges"]}
 
 
-@app.get("/v1/myriad/topk", dependencies=auth)
+@app.get("/v1/myriad/topk", dependencies=auth + guard)
 async def get_topk():
     return {"object": "myriad.topk", "layers": [
         {"layer": i, "top_k": int(l.mlp.top_k),
@@ -1272,7 +1328,7 @@ async def get_topk():
         for i, l in enumerate(engine.layers)]}
 
 
-@app.post("/v1/myriad/topk", dependencies=auth)
+@app.post("/v1/myriad/topk", dependencies=auth + guard)
 async def set_topk(body: TopKBody):
     try:
         res = engine.set_top_k(body.layer, body.k)
@@ -1281,7 +1337,7 @@ async def set_topk(body: TopKBody):
     return {"object": "myriad.topk.updated", **res}
 
 
-@app.post("/v1/myriad/clusters/{cid}/cage", dependencies=auth)
+@app.post("/v1/myriad/clusters/{cid}/cage", dependencies=auth + guard)
 async def cage_cluster(cid: int):
     try:
         res = engine.cage(cid)
@@ -1290,16 +1346,18 @@ async def cage_cluster(cid: int):
     return {"object": "myriad.cluster.caged", **res}
 
 
-@app.post("/v1/myriad/clusters/{cid}/free", dependencies=auth)
-async def free_cluster(cid: int):
+@app.post("/v1/myriad/clusters/{cid}/free", dependencies=auth + guard)
+async def free_cluster(cid: int, layer: Optional[int] = None):
+    """layer 省略 = 整宗释放（向后兼容）；指定 layer = 仅解封该层，用于单层狙击的单点撤销。"""
     try:
-        res = engine.free(cid)
+        res = engine.free(cid, layer)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"object": "myriad.cluster.freed", **res}
+    obj = "myriad.cluster.layer_freed" if layer is not None else "myriad.cluster.freed"
+    return {"object": obj, **res}
 
 
-@app.post("/v1/myriad/snipe", dependencies=auth)
+@app.post("/v1/myriad/snipe", dependencies=auth + guard)
 async def snipe_cluster(body: SnipeBody):
     try:
         res = engine.snipe(body.layer, body.cluster)
@@ -1308,7 +1366,7 @@ async def snipe_cluster(body: SnipeBody):
     return {"object": "myriad.cluster.sniped", **res}
 
 
-@app.post("/v1/myriad/cartridge/plug", dependencies=auth)
+@app.post("/v1/myriad/cartridge/plug", dependencies=auth + guard)
 async def plug_cartridge(file: Optional[UploadFile] = File(None),
                          path: Optional[str] = Form(None),
                          slot: int = Form(16)):
@@ -1327,12 +1385,12 @@ async def plug_cartridge(file: Optional[UploadFile] = File(None),
     return {"object": "myriad.cartridge.plugged", **res}
 
 
-@app.post("/v1/myriad/engine", dependencies=auth)
+@app.post("/v1/myriad/engine", dependencies=auth + guard)
 async def set_engine(body: EngineBody):
     return {"object": "myriad.engine", **engine.set_engine(body.cuda_graph, body.max_len)}
 
 
-@app.get("/v1/myriad/metrics", dependencies=auth)
+@app.get("/v1/myriad/metrics", dependencies=auth + guard)
 async def metrics(format: str = "json"):
     if format == "prometheus":
         return PlainTextResponse(engine.metrics.prometheus(),
