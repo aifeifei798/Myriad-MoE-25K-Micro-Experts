@@ -226,6 +226,28 @@ The closed-form solve is `[3072, 3072]`, so sample count `N` must comfortably ex
 
 Reported fidelity is measured on a **held-out 20%** split (by document order, not random) with `λ` selected on that same split — an earlier version reported on the fitting set with a fixed `λ`, a number that could be tuned rather than trusted.
 
+### Choosing `--micro-scale`
+
+`--micro-scale` sets how much micro-expert `Δ` gets injected. The default is **0.0125**, chosen by sweeping the Dense export over 27 held-out prompts (written fresh, not drawn from the calibration corpus) and scoring 4-gram repetition against the unbaked base:
+
+| `--micro-scale` | Fidelity | rep_rate | vs. base | distinct-2 | agree with base | Identical to base |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| *base, unbaked* | — | 0.2720 | — | 0.6559 | — | — |
+| 0.0000 (Δ_sci only) | 0.9867 | 0.2746 | +0.0026 | 0.6428 | 0.7940 | 17/27 |
+| **0.0125** (default) | 0.9913 | **0.2567** | **−0.0153** | 0.6416 | 0.7211 | 14/27 |
+| 0.025 | 0.9935 | 0.3027 | +0.0307 | 0.6057 | 0.5231 | 7/27 |
+| 0.0500 | 0.9950 | 0.3359 | +0.0639 | 0.5842 | 0.3727 | 3/27 |
+| 0.1000 | 0.9958 | 0.3423 | +0.0702 | 0.5520 | 0.2176 | 2/27 |
+
+Two things worth knowing before you retune this:
+
+- **Fidelity rises with `micro_scale`, quality peaks in the middle.** Fidelity measures only whether `Δ` is expressible in `down_proj` — a larger `Δ` is a stronger signal and is easier to capture. It says nothing about language quality. Selecting `micro_scale` by fidelity alone walks you straight to 0.1, the worst row in the table.
+- **The two goals genuinely conflict.** "Preserve base capability" and "make micro-expert behavior visible" cannot both be maximized. Low values keep the model intact; high values make `Δ` obvious (agreement with base drops to 0.37 / 0.22) while degradation climbs. 0.0125 is the only setting that does not regress repetition while still leaving `Δ` measurable — `agree` 0.72 means the baked model is clearly not just the base model.
+
+⚠ **Caveat on the numbers above.** 27 prompts, greedy decoding, single corpus (the built-in synthetic one). The −0.0153 edge over the base is small enough to sit near the noise floor, so treat 0.0125 as a reasonable default rather than a proven optimum. Re-run the sweep with `--calib-file` on real text before relying on it for a release.
+
+The MoE export defaults to the same 0.0125 so the two formats can be compared directly, but it needs less tuning — it preserves sparse routing, so its dense-ensembling distortion is absent.
+
 ---
 
 ---

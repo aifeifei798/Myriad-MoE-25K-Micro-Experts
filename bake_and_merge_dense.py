@@ -92,7 +92,9 @@ def build_parser():
                    help="覆盖自动测定的门控均值（对所有层统一）")
     p.add_argument("--sci-scale", type=float, default=None,
                    help="在实测门控上再乘的系数（仅对 preset 生效）")
-    p.add_argument("--micro-scale", type=float, default=0.025, help="微专家缩放因子")
+    p.add_argument("--micro-scale", type=float, default=0.0125,
+                   help="微专家缩放因子。0.0125 为实测甜点（重复率优于底座）；"
+                        "调大会让微专家行为更显著但语言能力退化，详见 README")
     p.add_argument("--active-clusters", type=str, default=None, help="参与烘焙的宗门(逗号分隔)")
     p.add_argument("--cage-clusters", type=str, default=None, help="显式剔除的宗门(逗号分隔)")
     p.add_argument("--plug", action="append", metavar="[slot=]path.pt",
@@ -272,7 +274,9 @@ def main():
     print(f"[✔] 烘焙完成 {dur:.1f}s | 全局留出集保真度 {avg_fid:.4f} | "
           f"最低层 {min(good) if good else float('nan'):.4f}")
     if good and min(good) < 0.6:
-        print(f"    ⚠ 有层保真度 < 0.60，考虑加大 --calib-tokens 或降低 --micro-scale")
+        print(f"    ⚠ 有层保真度 < 0.60 —— 主因通常是校准语料欠定，"
+              f"请加大 --calib-tokens 或改用 --calib-file；"
+              f"调低 --micro-scale 通常无效（实测保真度反而随其增大而升高）")
 
     # ── 落盘 ──────────────────────────────────────────────────────────
     print(f"\n[*] 保存至 {args.output_dir} ...")

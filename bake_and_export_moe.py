@@ -102,7 +102,9 @@ def build_parser():
     p.add_argument("--num-experts-per-tok", type=int, default=2, help="Top-K 激活专家数")
     p.add_argument("--sci-weight", type=float, default=None,
                    help="覆盖实测门控均值（对所有层统一）")
-    p.add_argument("--micro-scale", type=float, default=0.025, help="微专家缩放因子")
+    p.add_argument("--micro-scale", type=float, default=0.0125,
+                   help="微专家缩放因子。与 Dense 脚本同默认值，便于两者对照；"
+                        "MoE 保留了稀疏路由，失真小于 Dense，通常无需调低")
     p.add_argument("--cage-clusters", type=str, default=None,
                    help="封印的宗门(逗号分隔)。封印=从导出模型里彻底移除该专家")
     p.add_argument("--plug", action="append", metavar="[slot=]path.pt", help="卡带挂载，可重复")
