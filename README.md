@@ -12,6 +12,8 @@
 
 [简体中文](https://github.com/aifeifei798/Myriad-MoE-25K-Micro-Experts/blob/main/README_zh_cn.md)
 
+> This repo contains **only the frontend**. The backend inference service and model weights (`myriad_*.pt`, see [🤗 Hugging Face](https://huggingface.co/aifeifei798/Myriad-MoE-25K-Micro-Experts)) live elsewhere and must be deployed separately.
+
 ## 💡 Executive Summary
 
 Traditional dense Large Language Models (LLMs) suffer from severe **multitask negative transfer (cross-domain gradient collision)**: fine-tuning for strict programming logic degrades humanistic eloquence and conversational nuance, while training for creative prose softens formal mathematical reasoning. Meanwhile, standard Mixture-of-Experts (MoE) architectures demand massive GPU VRAM capacity, creating an impassable barrier for extreme expert scaling on consumer-grade hardware.
